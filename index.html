@@ -2472,8 +2472,9 @@ function decodeTopo(topo, objNames) {
 function loadMap() {
   if (!mapPromise) mapPromise = (async () => {
     try {
-      const [w, u] = await Promise.all([fetch(MAPDATA.world).then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); }),
-                                        fetch(MAPDATA.us).then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); })]);
+      // map/<file>, or the same file next to the page (an upload that flattened the map folder)
+      const getMap = async (path) => { for (const u of [path, path.replace(/^map\//, '')]) { try { const r = await fetch(u); if (r.ok) return await r.json(); } catch (e) {} } throw new Error('not found'); };
+      const [w, u] = await Promise.all([getMap(MAPDATA.world), getMap(MAPDATA.us)]);
       return { ...decodeTopo(w, { coast: 'countries' }), ...decodeTopo(u, { states: 'states', counties: 'counties' }) };
     } catch (e) {
       mapFailed = true;
