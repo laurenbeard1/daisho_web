@@ -2257,7 +2257,7 @@ $('timebar').addEventListener('click', (e) => {
 
 // ── Movie: the 3D view turning while it steps through time, encoded to MP4 in the browser ──
 const MP4MUX_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.js';
-const MOV = { SIZES: { '1280x720': [1280, 720], '1920x1080': [1920, 1080], '1080x1080': [1080, 1080] } };
+const MOV = { RESET_EVERY: 40, SIZES: { '1280x720': [1280, 720], '1920x1080': [1920, 1080], '1080x1080': [1080, 1080] } };
 const mov = { busy: false, stop: false, blob: null, name: '', url: null };
 function loadScriptOnce(url, globalName) {
   if (window[globalName]) return Promise.resolve();
@@ -2313,6 +2313,36 @@ function releaseGL(gd) {
     if (gd._fullLayout) Plotly.purge(gd);
   } catch (e) {}
 }
+// one frame: the plot's SVG layers (background, then titles/colorbars/annotations) with each 3D scene's
+// WebGL canvas drawn in between. The canvases are read right after a forced redraw, in the same task.
+function svgLayerImage(svgEl, W, H, cache, defs) {
+  const clone = svgEl.cloneNode(true);
+  if (defs && !clone.querySelector('defs linearGradient')) clone.insertBefore(defs.cloneNode(true), clone.firstChild);
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg'); clone.setAttribute('width', W); clone.setAttribute('height', H);
+  const str = new XMLSerializer().serializeToString(clone);
+  if (cache.has(str)) return Promise.resolve(cache.get(str));
+  return loadImage('data:image/svg+xml;charset=utf-8,' + encodeURIComponent(str)).then((im) => {
+    cache.set(str, im); if (cache.size > 24) cache.delete(cache.keys().next().value); return im; }, () => null);
+}
+async function compositeFrame(off, ctx, W, H, cache) {
+  const svgs = [...off.querySelectorAll('.main-svg')];
+  const defs = svgs.map((el) => el.querySelector('defs')).find((d) => d && d.querySelector('linearGradient'));
+  const imgs = await Promise.all(svgs.map((el, k) => svgLayerImage(el, W, H, cache, k ? defs : null)));
+  const base = off.getBoundingClientRect();
+  ctx.fillStyle = BG3; ctx.fillRect(0, 0, W, H);
+  if (imgs[0]) ctx.drawImage(imgs[0], 0, 0, W, H);
+  for (const sc of Object.keys(off._fullLayout).filter((k) => /^scene\d*$/.test(k))) {
+    const g = off._fullLayout[sc]._scene && off._fullLayout[sc]._scene.glplot;
+    if (!g) continue;
+    // each scene has its own canvas (the offscreen plot is not a staticPlot, whose scenes share one canvas);
+    // force a redraw and copy the canvas in the same task, before the browser clears its drawing buffer
+    if (typeof g.setDirty === 'function') g.setDirty();
+    if (typeof g.draw === 'function') g.draw(); else g.redraw();
+    const cv = g.canvas, r = cv.getBoundingClientRect();
+    ctx.drawImage(cv, r.left - base.left, r.top - base.top, r.width, r.height);
+  }
+  for (let k = 1; k < imgs.length; k++) if (imgs[k]) ctx.drawImage(imgs[k], 0, 0, W, H);
+}
 function loadImage(url) { return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error('a frame could not be drawn')); im.src = url; }); }
 function rotateCam(cam, deg) {
   const a = deg * Math.PI / 180, c = cam.center || { x: 0, y: 0, z: 0 };
@@ -2342,10 +2372,15 @@ async function makeMovie() {
     enc = new VideoEncoder({ output: (chunk, meta) => muxer.addVideoChunk(chunk, meta), error: (e) => { failed = e; } });
     enc.configure({ codec, width: W, height: H, bitrate, framerate: fps });
     const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext('2d');
+    // a CPU-side canvas: frames are copied out as plain pixels, so no GPU-backed frame is handed to the encoder
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const gd = $('plot3d');
+    let ctxLost = false;
+    const onLost = (e) => { e.preventDefault(); ctxLost = true; };
+    off.addEventListener('webglcontextlost', onLost, true);
     const cam0 = (gd._fullLayout && gd._fullLayout.scene && gd._fullLayout.scene.camera) ? JSON.parse(JSON.stringify(gd._fullLayout.scene.camera)) : { eye: V3.START_EYE, center: { x: 0, y: 0, z: 0 }, up: { x: 0, y: 0, z: 1 } };
-    let last = null, fig = null, started = performance.now();
+    let last = null, fig = null, plotted = false, sinceReset = 0, retries = 0, started = performance.now();
+    const cache = new Map(), cfg = { staticPlot: false, displayModeBar: false, scrollZoom: false, showTips: false, plotGlPixelRatio: 1 };
     for (let f = 0; f < P.frames.length; f++) {
       if (mov.stop) throw new Error('stopped');
       if (failed) throw failed;
@@ -2358,21 +2393,40 @@ async function makeMovie() {
         fig.layout.title.font.size = Math.round(15 * W / 1280);
         last = key;
       }
-      for (const k of Object.keys(fig.layout).filter((k) => /^scene\d*$/.test(k))) fig.layout[k].camera = cam;
-      // one short-lived WebGL context per frame, released at once so the page's own 3D view and map keep theirs
-      releaseGL(off);
-      await Plotly.newPlot(off, fig.data, fig.layout, { staticPlot: true, displayModeBar: false, plotGlPixelRatio: 1 });
-      const svg = Plotly.Snapshot.toSVG(off);
-      ctx.fillStyle = BG3; ctx.fillRect(0, 0, W, H);
-      ctx.drawImage(await loadImage('data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)), 0, 0, W, H);
-      const vf = new VideoFrame(canvas, { timestamp: Math.round(f * 1e6 / fps), duration: Math.round(1e6 / fps) });
+      const sceneKeys = Object.keys(fig.layout).filter((k) => /^scene\d*$/.test(k));
+      // start the offscreen plot over every RESET_EVERY frames, and whenever the browser drops its graphics
+      // context, so graphics memory can't pile up over a long movie
+      if (plotted && (ctxLost || sinceReset >= MOV.RESET_EVERY)) {
+        releaseGL(off); plotted = false; sinceReset = 0; fig.drawn = false;
+        await sleep(30); ctxLost = false;            // our own release also fires the lost event; ignore it
+      }
+      // one offscreen plot for the whole movie: its WebGL contexts are made once and reused every frame
+      // (making and dropping contexts frame after frame is what crashed the page on real graphics cards)
+      if (!plotted) {
+        for (const k of sceneKeys) fig.layout[k].camera = cam;
+        await Plotly.newPlot(off, fig.data, fig.layout, cfg); plotted = true; fig.drawn = true;
+      } else if (!fig.drawn) {
+        for (const k of sceneKeys) fig.layout[k].camera = cam;
+        await Plotly.react(off, fig.data, fig.layout, cfg); fig.drawn = true;
+      } else {
+        const u = {}; for (const k of sceneKeys) u[k + '.camera'] = cam;
+        await Plotly.relayout(off, u);
+      }
+      sinceReset++;
+      await compositeFrame(off, ctx, W, H, cache);
+      if (ctxLost) {                                  // this frame may be blank: rebuild the plot and draw it again
+        if (++retries > 5) throw new Error('the browser kept dropping the 3D graphics. Try a smaller size or a coarser resolution.');
+        f--; continue;
+      }
+      const px = ctx.getImageData(0, 0, W, H);
+      const vf = new VideoFrame(px.data, { format: 'RGBA', codedWidth: W, codedHeight: H, timestamp: Math.round(f * 1e6 / fps), duration: Math.round(1e6 / fps) });
       enc.encode(vf, { keyFrame: f % (fps * 2) === 0 });
       vf.close();
-      while (enc.encodeQueueSize > 6) await sleep(5);
+      while (enc.encodeQueueSize > 3) await sleep(5);
       const el = (performance.now() - started) / 1000, left = el / (f + 1) * (P.frames.length - f - 1);
       $('movFill').style.width = (100 * (f + 1) / P.frames.length).toFixed(1) + '%';
       $('movStatus').textContent = `Frame ${f + 1} of ${P.frames.length} · about ${left < 90 ? Math.round(left) + ' s' : Math.round(left / 60) + ' min'} left`;
-      if (f % 4 === 0) await sleep(0);
+      await sleep(0);
     }
     await enc.flush();
     muxer.finalize();
@@ -2393,6 +2447,10 @@ async function makeMovie() {
     try { if (enc && enc.state !== 'closed') enc.close(); } catch (e) {}
     releaseGL(off);
     off.remove();
+    try {
+      const fl = $('plot3d')._fullLayout, lost = fl && Object.keys(fl).filter((k) => /^scene\d*$/.test(k)).some((k) => { const g = fl[k]._scene && fl[k]._scene.glplot && fl[k]._scene.glplot.gl; return g && g.isContextLost(); });
+      if (lost) { Plotly.purge($('plot3d')); s3.plotted = false; redraw3d(); }
+    } catch (e) {}
     mov.busy = false; $('movStop').hidden = true; $('movBar').hidden = true;
     movControls();
   }
